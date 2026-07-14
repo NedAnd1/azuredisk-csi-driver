@@ -603,7 +603,7 @@ func TestWaitForDiskManagedByToBeRemovedDisabled(t *testing.T) {
 
 	diskURI := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/disks/disk-name",
 		testCloud.SubscriptionID, testCloud.ResourceGroup)
-	err := common.waitForDiskManagedByTobeRemoved(t.Context(), diskURI, "vm1")
+	err := common.waitForDiskManagedByToBeRemoved(t.Context(), diskURI, "vm1")
 	assert.NoError(t, err)
 }
 

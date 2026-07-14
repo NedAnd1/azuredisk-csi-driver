@@ -29,6 +29,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kwait "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
@@ -378,14 +381,53 @@ func (c *controllerCommon) retrieveAttachBatchedDiskRequests(nodeName, diskURI s
 	return diskMap, nil
 }
 
+func parseProviderID(providerID string) (vmResourceInfo, error) {
+	resourceID := strings.TrimPrefix(providerID, "azure://")
+	parts := strings.Split(strings.Trim(resourceID, "/"), "/")
+	if len(parts) < 8 || !strings.EqualFold(parts[0], "subscriptions") || !strings.EqualFold(parts[2], "resourceGroups") || !strings.EqualFold(parts[4], "providers") {
+		return vmResourceInfo{}, fmt.Errorf("unexpected providerID format: %q", providerID)
+	}
+	resourceGroup := parts[3]
+	switch {
+	case len(parts) >= 10 && strings.EqualFold(parts[6], "virtualMachineScaleSets") && strings.EqualFold(parts[8], "virtualMachines"):
+		return vmResourceInfo{resourceGroup: resourceGroup, vmssName: parts[7], name: parts[9]}, nil
+	case strings.EqualFold(parts[6], "virtualMachines"):
+		return vmResourceInfo{resourceGroup: resourceGroup, name: parts[7]}, nil
+	default:
+		return vmResourceInfo{}, fmt.Errorf("unsupported resource type in providerID: %q", providerID)
+	}
+}
+
 // DetachDisk detaches a disk from VM
 func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI string, nodeName types.NodeName) error {
+	if true /* ToDo: feature flag enabled by default */ {
+		node, err := c.getNode(ctx, string(nodeName))
+		if err == nil {
+			waitForDetach := true
+			var providerID string
+			if node != nil {
+				waitForDetach = c.WaitForDetachDiskComplete
+				providerID = node.Spec.ProviderID
+				if vmInfo, err := parseProviderID(providerID); err != nil {
+					klog.Warningf("failed to parse providerID (%s) for node %s: %v", providerID, nodeName, err)
+				} else if exists, err := c.vmExistsByResourceInfo(ctx, vmInfo); err != nil {
+					klog.Warningf("failed to check if instance exists for node %s: %v", nodeName, err)
+				} else if !exists {
+					node = nil
+					klog.Warningf("instance does not exist for node %s", nodeName)
+				}
+			}
+			if node == nil {
+				return c.waitForDiskManagedByToBeRemovedIf(waitForDetach, ctx, diskURI, nodeName, providerID)
+			}
+		}
+	}
 	if _, err := c.cloud.InstanceID(ctx, nodeName); err != nil {
 		if errors.Is(err, cloudprovider.InstanceNotFound) {
 			// if host doesn't exist, no need to detach
 			klog.Warningf("azureDisk - failed to get azure instance id(%s), DetachDisk(%s) will assume disk is already detached",
 				nodeName, diskURI)
-			return c.waitForDiskManagedByTobeRemoved(ctx, diskURI, nodeName)
+			return c.waitForDiskManagedByToBeRemoved(ctx, diskURI, nodeName)
 		}
 		klog.Warningf("failed to get azure instance id (%v)", err)
 		return fmt.Errorf("failed to get azure instance id for node %q: %w", nodeName, err)
@@ -462,7 +504,7 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
 			// if host doesn't exist, no need to detach
 			klog.Warningf("azureDisk - got InstanceNotFoundError(%v), DetachDisk(%s) will assume disk is already detached",
 				err, diskURI)
-			return c.waitForDiskManagedByTobeRemoved(ctx, diskURI, nodeName)
+			return c.waitForDiskManagedByToBeRemoved(ctx, diskURI, nodeName)
 		}
 
 		// if operation is preempted by a force operation on VM, check if the disk got detached before returning error
@@ -496,6 +538,71 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
 
 	klog.V(2).Infof("azureDisk - detach disk(%s) succeeded", diskName)
 	return nil
+}
+
+func (c *controllerCommon) getNode(ctx context.Context, nodeName string) (*corev1.Node, error) {
+	if c.nodeLister != nil {
+		obj, err := c.nodeLister.Get(nodeName)
+		if err == nil {
+			node, ok := obj.(*corev1.Node)
+			if !ok {
+				return nil, fmt.Errorf("node(%s) from lister is not *corev1.Node", nodeName)
+			}
+			return node, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("get node(%s) from lister failed: %v", nodeName, err)
+		}
+		klog.V(4).Infof("getNode: node(%s) not found in lister cache", nodeName)
+		// Node was not found in the cache, fall back to getting it from the API server
+	}
+
+	if c.cloud.KubeClient == nil || c.cloud.KubeClient.CoreV1() == nil {
+		if c.nodeLister != nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("kubeClient and nodeLister are both nil")
+	}
+	node, err := c.cloud.KubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			klog.V(4).Infof("getNode: node(%s) not found in cluster", nodeName)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get node(%s) failed with %v", nodeName, err)
+	}
+	return node, nil
+}
+
+// vmResourceInfo captures the VM identity parsed from a node's providerID.
+type vmResourceInfo struct {
+	resourceGroup string
+	// vmssName is non-empty only for VMSS uniform instances.
+	vmssName string
+	// name is the VM resource name for standalone/flex VMs, or the instance ID for VMSS uniform instances.
+	name string
+}
+
+// vmExistsByResourceInfo issues a targeted GET for the VM identified by info,
+// mapping a 404 (or equivalent) to cloudprovider.InstanceNotFound.
+func (c *controllerCommon) vmExistsByResourceInfo(ctx context.Context, info vmResourceInfo) (bool, error) {
+	if info.vmssName != "" {
+		if _, err := c.clientFactory.GetVirtualMachineScaleSetVMClient().Get(ctx, info.resourceGroup, info.vmssName, info.name); err != nil {
+			if isInstanceNotFoundError(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+
+	if _, err := c.clientFactory.GetVirtualMachineClient().Get(ctx, info.resourceGroup, info.name, nil); err != nil {
+		if isInstanceNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // UpdateVM updates a vm
@@ -756,8 +863,12 @@ func (c *controllerCommon) isMaxDataDiskCountExceeded(ctx context.Context, nodeN
 // For cases where an instance is deleted, we assume the disk is detached, but it actually
 // takes a while for disk property to be updated. We do not want to presume such disks to be detached
 // without waiting for disk to be actually detached.
-func (c *controllerCommon) waitForDiskManagedByTobeRemoved(ctx context.Context, diskURI string, nodeName types.NodeName) error {
-	if !c.WaitForDetachDiskComplete {
+func (c *controllerCommon) waitForDiskManagedByToBeRemoved(ctx context.Context, diskURI string, nodeName types.NodeName) error {
+	return c.waitForDiskManagedByToBeRemovedIf(c.WaitForDetachDiskComplete, ctx, diskURI, nodeName, "")
+}
+
+func (c *controllerCommon) waitForDiskManagedByToBeRemovedIf(condition bool, ctx context.Context, diskURI string, nodeName types.NodeName, lastProviderID string) error {
+	if !condition {
 		klog.V(2).Infof("azureDisk - skip waiting for detach disk completion on diskURI(%s)", diskURI)
 		return nil
 	}
@@ -766,7 +877,7 @@ func (c *controllerCommon) waitForDiskManagedByTobeRemoved(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	klog.V(2).Infof("azureDisk - waitForDiskManagedByTobeRemoved: diskURI(%s)", diskURI)
+	klog.V(2).Infof("azureDisk - waitForDiskManagedByToBeRemoved: diskURI(%s)", diskURI)
 	var disk *armcompute.Disk
 	waitFunc := func(ctx context.Context) (bool, error) {
 		diskclient, err := c.clientFactory.GetDiskClientForSub(subsID)
@@ -775,12 +886,29 @@ func (c *controllerCommon) waitForDiskManagedByTobeRemoved(ctx context.Context, 
 		}
 		disk, err = diskclient.Get(ctx, resourceGroup, diskName)
 		if err != nil {
+			if isInstanceNotFoundError(err) {
+				klog.V(2).Infof("azureDisk - disk %s not found, assuming detached", diskURI)
+				return true, nil
+			}
 			return false, fmt.Errorf("error getting disk: %w", err)
 		}
 
 		if disk.ManagedBy == nil {
 			return true, nil
 		}
+
+		if lastProviderID != "" {
+			if !strings.EqualFold(lastProviderID, *disk.ManagedBy) {
+				klog.Warningf("expected to be detached from node %s, but found attached to %s, assuming as detached from original node", lastProviderID, *disk.ManagedBy)
+				return true, nil
+			}
+			return false, nil
+		}
+
+		// Keep the provider ID so we don't have to resolve it again in the next iteration
+		// This helps us avoid multiple expensive cache refreshes if we find that the node no longer exists
+		lastProviderID = *disk.ManagedBy
+
 		attachedNode, err := c.cloud.VMSet.GetNodeNameByProviderID(ctx, *disk.ManagedBy)
 		if err != nil {
 			if errors.Is(err, cloudprovider.InstanceNotFound) || isInstanceNotFoundError(err) {
@@ -799,7 +927,7 @@ func (c *controllerCommon) waitForDiskManagedByTobeRemoved(ctx context.Context, 
 	}
 	err = kwait.ExponentialBackoffWithContext(ctx, defaultBackOff, waitFunc)
 	if err != nil && disk != nil && disk.ManagedBy != nil {
-		klog.Errorf("error in - waitForDiskManagedByTobeRemoved, disk %s still has ManagedBy (VM resource ID) %s", diskURI, *disk.ManagedBy)
+		klog.Errorf("error in - waitForDiskManagedByToBeRemoved, disk %s still has ManagedBy (VM resource ID) %s", diskURI, *disk.ManagedBy)
 	}
 	return err
 }
